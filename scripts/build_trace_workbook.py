@@ -82,6 +82,8 @@ def clean(value):
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False)
     value = ILLEGAL_CHARACTERS_RE.sub("", str(value))
+    if value.startswith(("=", "+", "-", "@")):
+        value = "'" + value
     return value[:32700]
 
 

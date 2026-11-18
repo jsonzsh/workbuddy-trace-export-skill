@@ -55,6 +55,7 @@ Query parameters:
 
 - `range.start`
 - `range.end`
+- Preserve the captured organization-scope parameters from the list request; remove only `page` and `pageSize` before requesting statistics.
 
 The same 7-day span restriction applies. Observed fields:
 

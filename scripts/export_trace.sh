@@ -16,10 +16,6 @@ if [[ ! "$START_LOCAL" =~ $TIME_PATTERN ]] || [[ ! "$END_LOCAL" =~ $TIME_PATTERN
   echo "Dates must use 'YYYY-MM-DD HH:MM:SS' in China Standard Time (UTC+8)." >&2
   exit 2
 fi
-if [[ -z "${PLAYWRIGHT_MCP_EXTENSION_TOKEN:-}" ]]; then
-  echo "Set PLAYWRIGHT_MCP_EXTENSION_TOKEN for the current Chrome profile first." >&2
-  exit 2
-fi
 if ! command -v playwright-cli >/dev/null 2>&1; then
   echo "playwright-cli is required. Install it with: npm install -g @playwright/cli@latest" >&2
   exit 2
@@ -37,6 +33,46 @@ export PLAYWRIGHT_MCP_EXTENSION=1
 
 playwright-cli open "$TRACE_URL" >/dev/null
 playwright-cli --raw run-code "async page => {
+  await page.waitForTimeout(5000);
+  const organizationInput = page.getByPlaceholder('全部组织（可多选，仅统计所选部门直属成员）');
+  await organizationInput.waitFor({ state: 'visible', timeout: 30000 });
+  await organizationInput.click({ force: true });
+  await page.waitForTimeout(800);
+
+  const options = page.locator('.t-tree-select-popup label.t-checkbox');
+  const selected = [];
+  const excluded = [];
+  const optionCount = await options.count();
+  if (!optionCount) throw new Error('No organization options found. Confirm the organization tree selector and login state.');
+  for (let i = 0; i < optionCount; i++) {
+    const option = options.nth(i);
+    const name = (await option.innerText()).trim();
+    const input = option.locator('input[type=checkbox]');
+    const checked = await input.isChecked();
+    if (name === '不导出') {
+      excluded.push(name);
+      if (checked) {
+        await option.evaluate(el => el.click());
+        await page.waitForTimeout(80);
+      }
+    } else {
+      selected.push(name);
+      if (!checked) {
+        await option.evaluate(el => el.click());
+        await page.waitForTimeout(80);
+      }
+    }
+  }
+  if (!selected.length) throw new Error('No organization nodes were selected.');
+  const optionStates = await options.evaluateAll(els => els.map(e => ({
+    name: e.innerText.trim(),
+    checked: e.querySelector('input').checked
+  })));
+  if (optionStates.some(s => s.name === '不导出' ? s.checked : !s.checked)) {
+    throw new Error('Organization checkbox verification failed: ' + JSON.stringify(optionStates));
+  }
+  await page.keyboard.press('Escape');
+
   let headers = null;
   let firstUrl = null;
   page.on('request', r => {
@@ -47,7 +83,7 @@ playwright-cli --raw run-code "async page => {
   });
   await page.getByRole('button', { name: '搜索', exact: true }).click();
   await page.waitForTimeout(2500);
-  if (!headers || !firstUrl) throw new Error('No trace request captured. Confirm the Chrome extension connection and login state.');
+  if (!headers || !firstUrl) throw new Error('No trace request captured after applying organization filters.');
 
   const captured = new URL(firstUrl);
   const start = Number('$START_TS');
@@ -81,6 +117,7 @@ playwright-cli --raw run-code "async page => {
       const right = await fetchRange(mid + 1, e, depth + 1);
       return left.concat(right);
     }
+    if (total >= 1000) throw new Error('A one-second segment still contains at least 1000 records; manual investigation is required.');
     const records = [...(first.records || [])];
     const pages = Math.ceil(total / 100);
     for (let p = 2; p <= pages; p++) {
@@ -104,7 +141,8 @@ playwright-cli --raw run-code "async page => {
   for (const segment of segments) {
     const u = new URL(captured.toString());
     u.pathname = u.pathname.replace(/\/traces$/, '/trace-stats');
-    u.search = '';
+    u.searchParams.delete('page');
+    u.searchParams.delete('pageSize');
     u.searchParams.set('range.start', String(segment.start));
     u.searchParams.set('range.end', String(segment.end));
     const r = await page.request.get(u.toString(), { headers });
@@ -128,6 +166,7 @@ playwright-cli --raw run-code "async page => {
       endLocal: '$END_LOCAL +08:00'
     },
     exportedAt: new Date().toISOString(),
+    organizationScope: { selected, excluded, optionStates },
     count: records.length,
     fields: records[0] ? Object.keys(records[0]) : [],
     pageStats: {
@@ -142,4 +181,4 @@ playwright-cli --raw run-code "async page => {
   };
 }" > "$OUTPUT_JSON"
 
-python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(json.dumps({"output":p,"records":d["count"],"segments":len(d["segments"]),"pageConversations":d["pageStats"]["conversations"]["value"],"pageCredits":d["pageStats"]["credits"]["value"],"statsError":d["pageStatsError"]},ensure_ascii=False))' "$OUTPUT_JSON"
+python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(json.dumps({"output":p,"records":d["count"],"segments":len(d["segments"]),"allSegmentsComplete":all(s["downloaded"]==s["total"] for s in d["segments"]),"uniqueTraceIds":len({r.get("traceId") for r in d["records"]}),"pageConversations":d["pageStats"]["conversations"]["value"],"pageCredits":d["pageStats"]["credits"]["value"],"statsError":d["pageStatsError"],"organizationSelected":len(d["organizationScope"]["selected"]),"organizationExcluded":d["organizationScope"]["excluded"]},ensure_ascii=False))' "$OUTPUT_JSON"
